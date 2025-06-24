@@ -1,105 +1,88 @@
+// webhook.js
 const express = require('express');
-const bot = require('./bot');
-const logger = require('./utils/logger');
+const bot     = require('./bot');
+const logger  = require('./utils/logger');
 const { validateEventData } = require('./utils/validator');
 
 const router = express.Router();
 
-// Webhook endpoint for Google Scripts
+/**
+ * POST /webhook/google-scripts
+ * Expects payload: { guildId, eventData: { name, description, scheduledStartTime, scheduledEndTime, privacyLevel, entityType, entityMetadata } }
+ */
 router.post('/google-scripts', async (req, res) => {
-    try {
-        logger.info('Received webhook request from Google Scripts:', req.body);
+  // 1) Log incoming payload
+  logger.info('🔥 Webhook payload:', JSON.stringify(req.body));
 
-        // Validate the incoming data
-        const validation = validateEventData(req.body);
-        if (!validation.isValid) {
-            logger.error('Invalid event data:', validation.errors);
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid event data',
-                details: validation.errors
-            });
-        }
+  // 2) Validate top-level and nested eventData
+  const { guildId, eventData } = req.body;
+  if (!guildId || typeof eventData !== 'object') {
+    logger.error('❌ Missing guildId or eventData:', req.body);
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid payload shape',
+      details: ['guildId is required','eventData object is required']
+    });
+  }
+  const validation = validateEventData(eventData);
+  if (!validation.isValid) {
+    logger.error('❌ EventData validation failed:', validation.errors);
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid eventData fields',
+      details: validation.errors
+    });
+  }
 
-        const { guildId, eventData } = req.body;
+  try {
+    // 3) Create the Scheduled Event via your bot module
+    const event = await bot.createEventFromWebhook(guildId, eventData);
+    logger.info(`✅ Created Scheduled Event ${event.name} (${event.id})`);
 
-        // Create the Discord event
-        const event = await bot.createEventFromWebhook(guildId, eventData);
-
-        logger.info(`Successfully created event: ${event.name} (${event.id})`);
-
-        res.json({
-            success: true,
-            message: 'Event created successfully',
-            eventId: event.id,
-            eventName: event.name,
-            scheduledStartTime: event.scheduledStartTime
-        });
-
-    } catch (error) {
-        logger.error('Error processing webhook:', error);
-
-        let statusCode = 500;
-        let errorMessage = 'Internal server error';
-
-        if (error.message.includes('Bot is not ready')) {
-            statusCode = 503;
-            errorMessage = 'Discord bot is not ready';
-        } else if (error.message.includes('Guild') && error.message.includes('not found')) {
-            statusCode = 404;
-            errorMessage = 'Discord server not found';
-        } else if (error.message.includes('Missing Permissions')) {
-            statusCode = 403;
-            errorMessage = 'Bot lacks permissions to create events';
-        }
-
-        res.status(statusCode).json({
-            success: false,
-            error: errorMessage,
-            details: error.message
-        });
+    // 4) Optionally send a chat confirmation (if your bot module supports it)
+    if (typeof bot.sendChatNotification === 'function') {
+      await bot.sendChatNotification(guildId, process.env.NOTIFY_CHANNEL_ID, event);
+      logger.info(`💬 Sent notification in channel ${process.env.NOTIFY_CHANNEL_ID}`);
     }
+
+    // 5) Return success payload
+    return res.json({
+      success: true,
+      eventId: event.id,
+      eventName: event.name,
+      scheduledStartTime: event.scheduledStartTime.toISOString()
+    });
+  } catch (err) {
+    // 6) Error handling & mapping to status codes
+    logger.error('❌ Error processing webhook:', err);
+
+    let statusCode = 500;
+    let message    = 'Internal server error';
+
+    if (err.message.includes('Bot is not ready')) {
+      statusCode = 503; message = 'Discord bot not ready';
+    } else if (err.message.includes('Guild') && err.message.includes('not found')) {
+      statusCode = 404; message = 'Discord server (guild) not found';
+    } else if (err.message.includes('Missing Permissions')) {
+      statusCode = 403; message = 'Bot lacks permissions to create events';
+    }
+
+    return res.status(statusCode).json({
+      success: false,
+      error: message,
+      details: err.message
+    });
+  }
 });
 
-// Health check for webhook endpoint
+// Simple health check
 router.get('/health', (req, res) => {
-    res.json({
-        status: 'OK',
-        service: 'Discord Event Webhook',
-        timestamp: new Date().toISOString(),
-        botReady: bot.isReady
-    });
-});
-
-// Example endpoint to show expected payload format
-router.get('/example-payload', (req, res) => {
-    const examplePayload = {
-        guildId: "your-discord-server-id",
-        eventData: {
-            name: "Event Name",
-            description: "Event Description",
-            scheduledStartTime: "2025-06-25T15:00:00.000Z",
-            scheduledEndTime: "2025-06-25T17:00:00.000Z",
-            privacyLevel: 2,
-            entityType: 3,
-            entityMetadata: {
-                location: "Event Location"
-            }
-        }
-    };
-
-    res.json({
-        message: "Example payload for creating Discord events via webhook",
-        example: examplePayload,
-        notes: {
-            guildId: "Required - Your Discord server ID",
-            scheduledStartTime: "Required - ISO 8601 format",
-            scheduledEndTime: "Optional - ISO 8601 format",
-            privacyLevel: "Optional - 2 for guild only (default)",
-            entityType: "Optional - 3 for external location (default)",
-            location: "Optional - Event location (default: 'TBD')"
-        }
-    });
+  res.json({
+    status:   'OK',
+    service:  'Discord Event Webhook',
+    timestamp:new Date().toISOString(),
+    botReady: bot.isReady || false
+  });
 });
 
 module.exports = router;
